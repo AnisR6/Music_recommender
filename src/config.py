@@ -1,8 +1,10 @@
 import os
+from pathlib import Path
 
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DATA_RAW = os.path.join(BASE_DIR, "data", "raw")
-DATA_PROCESSED = os.path.join(BASE_DIR, "data", "processed")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+DATA_RAW = DATA_DIR / "raw"
+DATA_PROCESSED = DATA_DIR / "processed"
 
 # Spotify MPD specific schema parameters
 MPD_SLICE_PREFIX = "mpd.slice."
