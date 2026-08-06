@@ -3,8 +3,10 @@ from lightfm import LightFM
 from scipy.sparse import coo_matrix
 
 class SpotifyHybridCollaborative:
-    def __init__(self, no_components: int = 64, loss: str = 'warp', lr: float = 0.05):
-        self.model = LightFM(no_components=no_components, loss=loss, learning_rate=lr)
+    def __init__(self, no_components: int = 64, loss: str = 'warp', lr: float = 0.05,
+                 item_alpha: float = 1e-6, user_alpha: float = 1e-6):
+        self.model = LightFM(no_components=no_components, loss=loss, learning_rate=lr,
+                              item_alpha=item_alpha, user_alpha=user_alpha)
         
     def fit(self, interactions: coo_matrix, item_features: coo_matrix = None, epochs: int = 15):
         """
