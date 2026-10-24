@@ -1,0 +1,21 @@
+{
+  "knn": {
+    "k": 200,
+    "shrink": 10.0
+  },
+  "als": {
+    "factors": 128,
+    "reg": 0.2,
+    "alpha": 60.0
+  },
+  "bpr": {
+    "factors": 256,
+    "lr": 0.1,
+    "iterations": 300
+  },
+  "blocks": {
+    "audio": 1.0,
+    "genre": 16.0,
+    "text": 0.3
+  }
+}

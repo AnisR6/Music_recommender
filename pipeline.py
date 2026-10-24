@@ -1,96 +1,113 @@
-import os
-import pandas as pd
+"""Run the whole pipeline without notebooks: data -> features -> models -> evaluation -> saved artifacts.
+
+    python pipeline.py            # about 2-3 minutes on a laptop
+    python cli.py                 # then use the console app
+
+The notebooks walk through the same steps with plots and commentary.
+"""
+import itertools
+import time
+
 import numpy as np
-from src.features.content_embeddings import SpotifyTrackVectorizer
-from src.features.interaction_matrix import InteractionMatrixBuilder
-from src.models.collaborative import SpotifyHybridCollaborative
-from src.models.fallback_handler import SpotifyColdStartRouter
+from sklearn.preprocessing import StandardScaler
 
-PROCESSED_INTERACTIONS = os.path.join('data', 'processed', 'playlist_track_interactions.csv')
+from src import artifacts, config
+from src.data.load import clean_catalog, load_raw
+from src.data.simulate import simulate_playlists
+from src.evaluation.metrics import compare, evaluate
+from src.features.audio_features import AudioFeatureEngineer, weighted
+from src.features.content_embeddings import combine
+from src.features.genre_embeddings import GenreEmbedder
+from src.features.interaction_matrix import InteractionMatrixBuilder, make_splits, save_splits, short_playlists
+from src.features.text_features import TextEmbedder
+from src.models.baselines import PopularityRecommender
+from src.models.collaborative import ALSRecommender, BPRRecommender, ItemKNN
+from src.models.content import ContentRecommender
+from src.models.hybrid import HybridRecommender, tune
 
 
-def load_playlist_track_data() -> pd.DataFrame:
-    """
-    Loads the real playlist-track interaction table built by
-    notebooks/02_preprocessing.ipynb if it's been generated, and falls
-    back to a tiny synthetic sample otherwise so this script still runs
-    standalone (e.g. as a smoke test) without requiring the notebooks
-    to be run first.
-    """
-    if os.path.exists(PROCESSED_INTERACTIONS):
-        print(f"Loading real processed data from {PROCESSED_INTERACTIONS}...")
-        df = pd.read_csv(PROCESSED_INTERACTIONS)
-        return df
-
-    print("No processed data found - run the notebooks/ pipeline first for real "
-          "data. Falling back to a small synthetic sample for now.")
-    data = {
-        'pid': [0, 0, 1, 1, 2, 2, 3],
-        'track_uri': ['spotify:track:101', 'spotify:track:102', 'spotify:track:101',
-                      'spotify:track:103', 'spotify:track:102', 'spotify:track:104', 'spotify:track:105'],
-        'track_name': ['Song A', 'Song B', 'Song A', 'Song C', 'Song B', 'Song D', 'Song E'],
-        'artist_name': ['Artist X', 'Artist Y', 'Artist X', 'Artist Z', 'Artist Y', 'Artist W', 'Artist V'],
-        'album_name': ['Album 1', 'Album 2', 'Album 1', 'Album 3', 'Album 2', 'Album 4', 'Album 5'],
-        'popularity': [85, 90, 85, 40, 90, 60, 10]
-    }
-    return pd.DataFrame(data)
+def step(msg):
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 def main():
-    print("Initializing Spotify MPD Hybrid Recommender Pipeline...")
+    config.DATA_PROCESSED.mkdir(parents=True, exist_ok=True)
 
-    df = load_playlist_track_data()
-    print(f"Loaded {len(df)} playlist-track rows, "
-          f"{df['pid'].nunique()} playlists, {df['track_uri'].nunique()} unique tracks.")
+    step("1/6 cleaning catalog")
+    tracks = clean_catalog(load_raw())
+    tracks.to_parquet(config.TRACKS_CLEAN)
+    print(f"      {len(tracks):,} tracks, {tracks.genres.explode().nunique()} genres")
 
-    # 1. Build Interaction Matrix
-    matrix_builder = InteractionMatrixBuilder()
-    coo_interactions = matrix_builder.build_coo_matrix(df)
-    print(f"Interaction Matrix Shape: {coo_interactions.shape}")
+    step("2/6 engineering features")
+    fe = AudioFeatureEngineer()
+    audio_df = fe.fit_transform(tracks)
+    audio = weighted(audio_df)
+    genre = GenreEmbedder().fit(tracks.genres, audio)
+    text = TextEmbedder().fit_transform(tracks)
+    blocks = {"audio": audio, "genre": genre.track_vectors(), "text": text}
 
-    # 2. Generate SBERT Content Embeddings
-    print("Generating dense SBERT vector embeddings for tracks...")
-    vectorizer = SpotifyTrackVectorizer()
-    unique_tracks = df[['track_uri', 'track_name', 'artist_name', 'album_name']].drop_duplicates()
-    embeddings = vectorizer.generate_track_embeddings(unique_tracks)
-    print(f"Generated Embeddings Matrix Shape: {embeddings.shape}")
+    step("3/6 simulating listeners")
+    inter, meta = simulate_playlists(tracks, audio, genre.similarity_)
+    inter.to_csv(config.INTERACTIONS, index=False)
+    meta.to_csv(config.PLAYLISTS, index=False)
+    builder = InteractionMatrixBuilder(tracks.track_uri.tolist())
+    M = builder.build(inter)
+    splits = make_splits(M)
+    save_splits(config.SPLITS, splits)
+    train, val, test, cold = splits["train"], splits["val"], splits["test"], splits["cold_test"]
+    print(f"      {M.shape[0]:,} playlists, {M.nnz:,} playlist-track pairs")
 
-    # 3. Train Hybrid Collaborative Model
-    print("Fitting LightFM Collaborative Latent Space...")
-    hybrid_model = SpotifyHybridCollaborative(no_components=32)
-    hybrid_model.fit(coo_interactions, epochs=15)
+    step("4/6 tuning content block weights on validation")
+    rng = np.random.default_rng(0)
+    val_users = rng.choice(np.where(np.diff(val.indptr) > 0)[0], 1500, replace=False)
+    best = None
+    for wa, wg, wt in itertools.product([1.0], [2, 4, 8, 16], [0.0, 0.1, 0.3]):
+        w = {"audio": wa, "genre": wg, "text": wt}
+        r = evaluate(ContentRecommender(combine(blocks, w)), train, val, users=val_users, ks=(20,))["recall@20"]
+        if best is None or r > best[0]:
+            best = (r, w)
+    block_weights = best[1]
+    E = combine(blocks, block_weights)
+    print(f"      best weights {block_weights}  val recall@20 {best[0]:.4f}")
+    artifacts.save_features(audio, audio_df.columns, blocks["genre"], text, E, genre.similarity_, block_weights)
 
-    # 4. Execute Cold-Start Routing Engine
-    router = SpotifyColdStartRouter(warm_playlist_threshold=5, warm_track_threshold=10)
+    step("5/6 training and evaluating models")
+    pop = PopularityRecommender().fit(train)
+    content = ContentRecommender(E)
+    knn = ItemKNN().fit(train)
+    als = ALSRecommender().fit(train)
+    bpr = BPRRecommender().fit(train)
+    hybrid = HybridRecommender(knn, als, content, pop).fit(train)
+    grid = {"kappa": [1, 2, 5, 15], "cf_mix": [0.3, 0.5, 0.7], "w_content": [0.25, 0.5, 1.0, 2.0], "w_pop": [0.0, 0.1]}
+    table = tune(hybrid, train, val, val_users, grid)
+    short, short_users = short_playlists(train)
+    short_val = short_users[np.isin(short_users, val_users)]
+    ku = tune(hybrid, short, val, short_val, {"kappa_user": [0, 5, 20, 60, 150, 400]})
+    print(f"      hybrid params {table.iloc[0].to_dict()}, kappa_user {ku.iloc[0].kappa_user}")
 
-    candidate_df = unique_tracks.copy()
-    candidate_df['track_idx'] = [matrix_builder.track_to_idx[t] for t in candidate_df['track_uri']]
-    interaction_counts = df.groupby('track_uri').size()
-    candidate_df['interaction_count'] = candidate_df['track_uri'].map(interaction_counts).fillna(0).astype(int)
-    if 'popularity' in df.columns:
-        first_popularity = df.drop_duplicates('track_uri').set_index('track_uri')['popularity']
-        candidate_df['popularity'] = candidate_df['track_uri'].map(first_popularity)
-    else:
-        candidate_df['popularity'] = candidate_df['interaction_count']
+    seen = train + val
+    raw_audio = ContentRecommender(StandardScaler().fit_transform(tracks[config.AUDIO_FEATURES]), name="Content (raw audio)")
+    text_only = ContentRecommender(text, name="Content (text only)")
+    models = [pop, raw_audio, text_only, content, knn, als, bpr, hybrid]
+    warm = {m.name: evaluate(m, train, test, exclude=seen, embeddings=E, popularity=tracks.popularity.values) for m in models}
+    coldr = {m.name: evaluate(m, train, cold, exclude=seen, candidates=splits["cold_items"]) for m in models}
+    shortr = {m.name: evaluate(m, short, test, exclude=seen, users=short_users) for m in models}
+    print("\nWarm tracks (held-out 20% of each playlist):")
+    print(compare(warm)[["recall@10", "recall@20", "ndcg@10", "hit@10", "coverage@10", "diversity@10"]].to_string())
+    print("\nNew releases (tracks never seen in training):")
+    print(compare(coldr)[["recall@10", "recall@20", "ndcg@10", "hit@10"]].to_string())
 
-    # 5. Route recommendations for the first playlist in the data
-    target_pid = df['pid'].iloc[0]
-    playlist_tracks = df[df['pid'] == target_pid]['track_uri'].tolist()
-    playlist_track_indices = [matrix_builder.track_to_idx[t] for t in playlist_tracks]
+    print("\nShort playlists (only 3 seed tracks):")
+    print(compare(shortr)[["recall@10", "recall@20", "ndcg@10", "hit@10"]].to_string())
 
-    sim_matrix = np.dot(embeddings, embeddings.T)
-    recs = router.route_recommendations(
-        playlist_idx=matrix_builder.playlist_to_idx[target_pid],
-        playlist_track_count=len(playlist_tracks),
-        candidate_tracks=candidate_df,
-        hybrid_model=hybrid_model,
-        content_similarity_matrix=sim_matrix,
-        playlist_track_indices=playlist_track_indices
-    )
-
-    print(f"\nTop Recommended Track URIs for Playlist {target_pid}:")
-    for idx, uri in enumerate(recs, 1):
-        print(f"{idx}. {uri}")
+    step("6/6 refitting on all playlists for the console app")
+    pop_f = PopularityRecommender().fit(M)
+    knn_f, als_f = ItemKNN().fit(M), ALSRecommender().fit(M)
+    final = HybridRecommender(knn_f, als_f, content, pop_f, **{k: float(table.iloc[0][k]) for k in grid},
+                               kappa_user=float(ku.iloc[0].kappa_user)).fit(M)
+    artifacts.save_models({"hybrid": final, "interactions": M, "block_weights": block_weights,
+                           "warm_results": warm, "cold_results": coldr, "short_results": shortr})
+    step(f"done. Try: python cli.py")
 
 
 if __name__ == "__main__":

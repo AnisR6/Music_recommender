@@ -1,0 +1,5 @@
+__pycache__/
+.ipynb_checkpoints/
+data/processed/models.pkl
+data/processed/playlist_track_interactions.csv
+.venv/
